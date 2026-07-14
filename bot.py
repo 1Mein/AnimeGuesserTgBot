@@ -9,13 +9,17 @@ import logging
 import os
 import random
 import re
-import sqlite3
 import time
 import unicodedata
+from contextlib import contextmanager
 from io import BytesIO
 from pathlib import Path
+from typing import Any, Iterator
 
+import psycopg2
+import psycopg2.extensions
 import requests
+from psycopg2.extras import RealDictCursor
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -28,7 +32,6 @@ from telegram.ext import (
 )
 
 BASE_DIR = Path(__file__).parent
-DB_PATH = BASE_DIR / "anime.db"
 SHIKIMORI_API = "https://shikimori.io/api"
 SHIKIMORI_CDN = "https://shikimori.io"
 MOVIESTILLS_BASE = "https://www.moviestillsdb.com"
@@ -57,40 +60,95 @@ try:
 except Exception:  # pragma: no cover
     BROWSER_SESSION = None
 
-def load_token() -> str:
+
+def _load_dotenv() -> dict[str, str]:
+    env: dict[str, str] = {}
     env_path = BASE_DIR / ".env"
-    if env_path.exists():
-        for line in env_path.read_text().splitlines():
-            line = line.strip()
-            if line.startswith("TELEGRAM_BOT_TOKEN="):
-                return line.split("=", 1)[1].strip().strip('"').strip("'")
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not env_path.exists():
+        return env
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        env[key.strip()] = value.strip().strip('"').strip("'")
+    return env
+
+
+_DOTENV = _load_dotenv()
+
+
+def load_token() -> str:
+    token = (
+        os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+        or _DOTENV.get("TELEGRAM_BOT_TOKEN", "").strip()
+    )
     if not token:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN in .env or environment")
     return token
 
 
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+def database_url() -> str:
+    url = (
+        os.environ.get("DATABASE_URL", "").strip()
+        or _DOTENV.get("DATABASE_URL", "").strip()
+    )
+    if not url:
+        raise SystemExit("Set DATABASE_URL in .env or environment")
+    return url
+
+
+@contextmanager
+def db() -> Iterator[psycopg2.extensions.connection]:
+    conn = psycopg2.connect(database_url(), cursor_factory=RealDictCursor)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def fetchone(conn, sql: str, params: tuple | list | None = None) -> dict | None:
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        return cur.fetchone()
+
+
+def fetchall(conn, sql: str, params: tuple | list | None = None) -> list[dict]:
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        return cur.fetchall()
+
+
+def execute(conn, sql: str, params: tuple | list | None = None) -> None:
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
 
 
 def init_score_tables() -> None:
     with db() as conn:
-        conn.executescript(
+        execute(
+            conn,
             """
             CREATE TABLE IF NOT EXISTS chat_scores (
-                chat_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
+                chat_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
                 username TEXT,
                 full_name TEXT,
-                score INTEGER NOT NULL DEFAULT 0,
+                score BIGINT NOT NULL DEFAULT 0,
                 PRIMARY KEY (chat_id, user_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_chat_scores_rank
-                ON chat_scores (chat_id, score DESC);
+            )
+            """,
+        )
+        execute(
+            conn,
             """
+            CREATE INDEX IF NOT EXISTS idx_chat_scores_rank
+                ON chat_scores (chat_id, score DESC)
+            """,
         )
 
 
@@ -174,15 +232,21 @@ def titles_match(guess: str, alias: str) -> bool:
     return levenshtein(g, a) <= limit
 
 
-def has_movies_table(conn: sqlite3.Connection) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='movies'"
-    ).fetchone()
+def has_movies_table(conn) -> bool:
+    row = fetchone(
+        conn,
+        """
+        SELECT 1 AS ok
+        FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = 'movies'
+        """,
+    )
     return bool(row)
 
 
-def random_anime_entry(conn: sqlite3.Connection) -> dict:
-    row = conn.execute(
+def random_anime_entry(conn) -> dict:
+    row = fetchone(
+        conn,
         """
         SELECT a.id, a.mal_id, a.series_id, a.title, a.title_romaji, a.title_english,
                a.title_native, a.title_russian, a.title_license_ru,
@@ -194,17 +258,20 @@ def random_anime_entry(conn: sqlite3.Connection) -> dict:
         WHERE a.mal_id IS NOT NULL
         ORDER BY RANDOM()
         LIMIT 1
-        """
-    ).fetchone()
+        """,
+    )
+    if not row:
+        raise RuntimeError("anime table is empty")
     item = dict(row)
     item["kind"] = "anime"
     return item
 
 
-def random_movie_entry(conn: sqlite3.Connection) -> dict | None:
+def random_movie_entry(conn) -> dict | None:
     if not has_movies_table(conn):
         return None
-    row = conn.execute(
+    row = fetchone(
+        conn,
         """
         SELECT m.id, m.imdb_id, m.title, m.title_russian, m.title_english,
                m.year, m.url, m.images, m.aliases, m.series_id,
@@ -213,8 +280,8 @@ def random_movie_entry(conn: sqlite3.Connection) -> dict | None:
         LEFT JOIN movie_series s ON s.id = m.series_id
         ORDER BY RANDOM()
         LIMIT 1
-        """
-    ).fetchone()
+        """,
+    )
     if not row:
         return None
     item = dict(row)
@@ -222,13 +289,13 @@ def random_movie_entry(conn: sqlite3.Connection) -> dict | None:
     return item
 
 
-def collect_anime_aliases(conn: sqlite3.Connection, anime: dict) -> list[str]:
+def collect_anime_aliases(conn, anime: dict) -> list[str]:
     aliases: list[str] = []
 
-    def add(*values: str | None) -> None:
+    def add(*values: Any) -> None:
         for v in values:
-            if v and normalize(v):
-                aliases.append(v)
+            if v and normalize(str(v)):
+                aliases.append(str(v))
 
     add(
         anime.get("title"),
@@ -244,16 +311,24 @@ def collect_anime_aliases(conn: sqlite3.Connection, anime: dict) -> list[str]:
 
     series_id = anime.get("series_id")
     if series_id:
-        for row in conn.execute(
+        for row in fetchall(
+            conn,
             """
             SELECT a.title, a.title_romaji, a.title_english, a.title_native,
                    a.title_russian, a.title_license_ru
             FROM anime a
-            WHERE a.series_id = ?
+            WHERE a.series_id = %s
             """,
             (series_id,),
         ):
-            add(*row)
+            add(
+                row["title"],
+                row["title_romaji"],
+                row["title_english"],
+                row["title_native"],
+                row["title_russian"],
+                row["title_license_ru"],
+            )
 
     seen: set[str] = set()
     unique: list[str] = []
@@ -490,11 +565,11 @@ def fetch_moviestills_frame(
     return fetch_moviestills_from_movie_page(movie_path)
 
 
-def pick_random_frame(conn: sqlite3.Connection) -> tuple[dict, str, list[str]]:
+def pick_random_frame(conn) -> tuple[dict, str, list[str]]:
     last_error = None
-    movies_ready = has_movies_table(conn) and conn.execute(
-        "SELECT 1 FROM movies LIMIT 1"
-    ).fetchone()
+    movies_ready = has_movies_table(conn) and fetchone(
+        conn, "SELECT 1 AS ok FROM movies LIMIT 1"
+    )
 
     for _ in range(MAX_TRIES):
         want_movie = bool(movies_ready) and random.random() < 0.5
@@ -552,36 +627,39 @@ def add_score(chat_id: int, user) -> int:
     full_name = (user.full_name if user else None) or "Игрок"
     user_id = user.id
     with db() as conn:
-        conn.execute(
+        execute(
+            conn,
             """
             INSERT INTO chat_scores (chat_id, user_id, username, full_name, score)
-            VALUES (?, ?, ?, ?, 1)
-            ON CONFLICT(chat_id, user_id) DO UPDATE SET
-                score = score + 1,
-                username = excluded.username,
-                full_name = excluded.full_name
+            VALUES (%s, %s, %s, %s, 1)
+            ON CONFLICT (chat_id, user_id) DO UPDATE SET
+                score = chat_scores.score + 1,
+                username = EXCLUDED.username,
+                full_name = EXCLUDED.full_name
             """,
             (chat_id, user_id, username, full_name),
         )
-        row = conn.execute(
-            "SELECT score FROM chat_scores WHERE chat_id = ? AND user_id = ?",
+        row = fetchone(
+            conn,
+            "SELECT score FROM chat_scores WHERE chat_id = %s AND user_id = %s",
             (chat_id, user_id),
-        ).fetchone()
+        )
         return int(row["score"])
 
 
 def ranking_text(chat_id: int, limit: int = 15) -> str:
     with db() as conn:
-        rows = conn.execute(
+        rows = fetchall(
+            conn,
             """
             SELECT username, full_name, score
             FROM chat_scores
-            WHERE chat_id = ?
+            WHERE chat_id = %s
             ORDER BY score DESC, full_name ASC
-            LIMIT ?
+            LIMIT %s
             """,
             (chat_id, limit),
-        ).fetchall()
+        )
     if not rows:
         return "🏆 Рейтинг этого чата пока пуст."
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
@@ -683,11 +761,8 @@ async def send_challenge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await send_chat_action(update)
 
     def _pick() -> tuple[dict, str, list[str]]:
-        conn = db()
-        try:
+        with db() as conn:
             return pick_random_frame(conn)
-        finally:
-            conn.close()
 
     try:
         # HTTP to MovieStillsDB/Shikimori is sync — keep the event loop free.
@@ -891,9 +966,10 @@ async def on_guess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def main() -> None:
     token = load_token()
-    if not DB_PATH.exists():
-        raise SystemExit(f"Database not found: {DB_PATH}")
+    # Fail fast if DATABASE_URL / network / schema are wrong.
+    database_url()
     init_score_tables()
+    log.info("Database: PostgreSQL")
     log.info("Movie stills: MovieStillsDB live fetch enabled")
 
     app = Application.builder().token(token).build()

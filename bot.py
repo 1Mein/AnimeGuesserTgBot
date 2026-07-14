@@ -876,18 +876,14 @@ async def on_guess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if check_guess(text, challenge["aliases"]):
         score = add_score(update.effective_chat.id, update.effective_user)
         answer = challenge["answer"]
-        url = challenge.get("url") or ""
         user = update.effective_user
         set_controller(context, user)
         who = f"@{user.username}" if user and user.username else (user.full_name if user else "Игрок")
         msg = (
             f"✅ Верно! {who}\n"
-            f"Попыток: {attempts} | Очки в чате: {score}\n"
             f"🎬 {answer}\n"
             f"Skip / Hint теперь у {who}"
         )
-        if url:
-            msg += f"\n{url}"
         await update.message.reply_text(msg, disable_web_page_preview=True)
         context.chat_data.pop("challenge", None)
         await send_challenge(update, context)

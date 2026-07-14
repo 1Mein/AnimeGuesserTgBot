@@ -35,6 +35,7 @@ MOVIESTILLS_BASE = "https://www.moviestillsdb.com"
 USER_AGENT = "ani_guesser_bot/1.0"
 MAX_TRIES = 12
 MAX_TYPOS = 3
+SUPER_USER_ID = 913414981
 
 CB_SKIP = "guess:skip"
 CB_HINT = "guess:hint"
@@ -143,7 +144,8 @@ def levenshtein(a: str, b: str) -> int:
 
 
 def allowed_typos(length: int) -> int:
-    if length <= 3:
+    # Titles shorter than 4 letters: exact match only.
+    if length < 4:
         return 0
     if length <= 6:
         return 1
@@ -159,8 +161,11 @@ def titles_match(guess: str, alias: str) -> bool:
         return False
     if g == a:
         return True
+    # Short titles (< 4 letters): no typos, no substring match.
+    if min(len(g), len(a)) < 4:
+        return False
     shorter, longer = (g, a) if len(g) <= len(a) else (a, g)
-    if len(shorter) >= 4 and shorter in longer:
+    if shorter in longer:
         if len(longer) - len(shorter) <= max(6, len(shorter) // 2):
             return True
     limit = min(MAX_TYPOS, allowed_typos(min(len(g), len(a))))
@@ -611,6 +616,8 @@ def controller_name(context: ContextTypes.DEFAULT_TYPE) -> str:
 
 def can_control(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user = update.effective_user
+    if user and user.id == SUPER_USER_ID:
+        return True
     cid = controller_id(context)
     if not user or cid is None:
         return False
@@ -626,19 +633,17 @@ async def deny_control(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 def make_hint(title: str) -> str:
-    letters = [c for c in title if c.isalnum()]
-    if not letters:
+    letter_idxs = [i for i, c in enumerate(title) if c.isalnum()]
+    if not letter_idxs:
         return ""
-    show = max(1, len(letters) // 3)
-    shown = 0
+    n = len(letter_idxs)
+    show = max(1, n // 3)
+    start = random.randint(0, max(0, n - show))
+    reveal = set(letter_idxs[start : start + show])
     out = []
-    for ch in title:
+    for i, ch in enumerate(title):
         if ch.isalnum():
-            if shown < show:
-                out.append(ch)
-                shown += 1
-            else:
-                out.append("•")
+            out.append(ch if i in reveal else "•")
         else:
             out.append(ch)
     return "".join(out)

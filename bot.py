@@ -150,6 +150,83 @@ def init_score_tables() -> None:
                 ON chat_scores (chat_id, score DESC)
             """,
         )
+        execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS chat_settings (
+                chat_id BIGINT PRIMARY KEY,
+                hint_cooldown INTEGER NOT NULL DEFAULT 0,
+                skip_cooldown INTEGER NOT NULL DEFAULT 0
+            )
+            """,
+        )
+
+
+def get_chat_settings(chat_id: int) -> dict[str, int]:
+    with db() as conn:
+        row = fetchone(
+            conn,
+            """
+            SELECT hint_cooldown, skip_cooldown
+            FROM chat_settings
+            WHERE chat_id = %s
+            """,
+            (chat_id,),
+        )
+    if not row:
+        return {"hint_cooldown": 0, "skip_cooldown": 0}
+    return {
+        "hint_cooldown": max(0, int(row["hint_cooldown"] or 0)),
+        "skip_cooldown": max(0, int(row["skip_cooldown"] or 0)),
+    }
+
+
+def set_chat_cooldown(chat_id: int, kind: str, seconds: int) -> int:
+    seconds = max(0, int(seconds))
+    if kind not in ("hint", "skip"):
+        raise ValueError(f"unknown cooldown kind: {kind}")
+    column = "hint_cooldown" if kind == "hint" else "skip_cooldown"
+    with db() as conn:
+        execute(
+            conn,
+            f"""
+            INSERT INTO chat_settings (chat_id, hint_cooldown, skip_cooldown)
+            VALUES (%s, 0, 0)
+            ON CONFLICT (chat_id) DO NOTHING
+            """,
+            (chat_id,),
+        )
+        execute(
+            conn,
+            f"UPDATE chat_settings SET {column} = %s WHERE chat_id = %s",
+            (seconds, chat_id),
+        )
+    return seconds
+
+
+def cooldown_remaining(context: ContextTypes.DEFAULT_TYPE, kind: str, seconds: int) -> int:
+    if seconds <= 0:
+        return 0
+    key = f"last_{kind}_at"
+    last = float(context.chat_data.get(key) or 0)
+    if not last:
+        return 0
+    left = int(seconds - (time.time() - last))
+    return max(0, left)
+
+
+def mark_cooldown_used(context: ContextTypes.DEFAULT_TYPE, kind: str) -> None:
+    context.chat_data[f"last_{kind}_at"] = time.time()
+
+
+async def deny_cooldown(
+    update: Update, kind: str, remaining: int
+) -> None:
+    label = "Hint" if kind == "hint" else "Skip"
+    msg = f"⏳ {label} на кулдауне: ещё {remaining} сек."
+    if update.callback_query:
+        await update.callback_query.answer(msg, show_alert=True)
+    # Команда без кнопки — без сообщения в чат (только answer у callback).
 
 
 def game_keyboard() -> InlineKeyboardMarkup:
@@ -837,12 +914,19 @@ async def do_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not can_control(update, context):
         await deny_control(update, context)
         return
+    chat = update.effective_chat
+    settings = get_chat_settings(chat.id) if chat else {"skip_cooldown": 0}
+    left = cooldown_remaining(context, "skip", settings["skip_cooldown"])
+    if left > 0:
+        await deny_cooldown(update, "skip", left)
+        return
     if update.callback_query:
         await update.callback_query.answer()
     challenge = context.chat_data.get("challenge")
     if challenge:
         await reply_text(update, f"Пропуск.\nПравильный ответ:\n🎬 {challenge['answer']}")
         context.chat_data.pop("challenge", None)
+    mark_cooldown_used(context, "skip")
     await send_challenge(update, context)
 
 
@@ -856,6 +940,12 @@ async def do_hint(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not can_control(update, context):
         await deny_control(update, context)
         return
+    chat = update.effective_chat
+    settings = get_chat_settings(chat.id) if chat else {"hint_cooldown": 0}
+    left = cooldown_remaining(context, "hint", settings["hint_cooldown"])
+    if left > 0:
+        await deny_cooldown(update, "hint", left)
+        return
     if update.callback_query:
         await update.callback_query.answer()
     challenge = context.chat_data.get("challenge")
@@ -866,7 +956,71 @@ async def do_hint(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not hint:
         await reply_text(update, "Подсказку дать нечего — жми Skip", with_keyboard=True)
         return
+    mark_cooldown_used(context, "hint")
     await reply_text(update, f"💡 Подсказка: {hint}", with_keyboard=True)
+
+
+def _parse_cooldown_arg(context: ContextTypes.DEFAULT_TYPE) -> int | None:
+    if not context.args:
+        return None
+    raw = (context.args[0] or "").strip().lower().rstrip("s")
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError("нужно число секунд, например: 15")
+    if value < 0 or value > 3600:
+        raise ValueError("кулдаун: от 0 до 3600 секунд")
+    return value
+
+
+async def hint_cd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if not chat:
+        return
+    try:
+        value = _parse_cooldown_arg(context)
+    except ValueError as e:
+        await reply_text(update, f"⛔ {e}\nПример: /hint_cd 20")
+        return
+    if value is None:
+        current = get_chat_settings(chat.id)["hint_cooldown"]
+        left = cooldown_remaining(context, "hint", current)
+        text = f"💡 Кулдаун Hint: {current} сек." if current else "💡 Кулдаун Hint: выключен."
+        if current and left > 0:
+            text += f"\nОсталось до следующего: {left} сек."
+        text += "\nЗадать: /hint_cd 20  (0 = выкл)"
+        await reply_text(update, text)
+        return
+    set_chat_cooldown(chat.id, "hint", value)
+    if value == 0:
+        await reply_text(update, "💡 Кулдаун Hint выключен.")
+    else:
+        await reply_text(update, f"💡 Кулдаун Hint: {value} сек.")
+
+
+async def skip_cd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if not chat:
+        return
+    try:
+        value = _parse_cooldown_arg(context)
+    except ValueError as e:
+        await reply_text(update, f"⛔ {e}\nПример: /skip_cd 30")
+        return
+    if value is None:
+        current = get_chat_settings(chat.id)["skip_cooldown"]
+        left = cooldown_remaining(context, "skip", current)
+        text = f"⏭ Кулдаун Skip: {current} сек." if current else "⏭ Кулдаун Skip: выключен."
+        if current and left > 0:
+            text += f"\nОсталось до следующего: {left} сек."
+        text += "\nЗадать: /skip_cd 30  (0 = выкл)"
+        await reply_text(update, text)
+        return
+    set_chat_cooldown(chat.id, "skip", value)
+    if value == 0:
+        await reply_text(update, "⏭ Кулдаун Skip выключен.")
+    else:
+        await reply_text(update, f"⏭ Кулдаун Skip: {value} сек.")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -876,7 +1030,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/start_guess — начать игру в этом чате\n"
         "/stop_guess — остановить\n"
         "/ranking — рейтинг чата\n"
-        "/skip /hint — или кнопки под кадром",
+        "/skip /hint — или кнопки под кадром\n"
+        "/skip_cd [сек] — кулдаун Skip\n"
+        "/hint_cd [сек] — кулдаун Hint",
     )
 
 
@@ -981,6 +1137,8 @@ def main() -> None:
     app.add_handler(CommandHandler("skip", skip_cmd))
     app.add_handler(CommandHandler("next", skip_cmd))
     app.add_handler(CommandHandler("hint", hint_cmd))
+    app.add_handler(CommandHandler("hint_cd", hint_cd_cmd))
+    app.add_handler(CommandHandler("skip_cd", skip_cd_cmd))
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^guess:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_guess))
 

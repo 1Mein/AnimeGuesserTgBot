@@ -1172,7 +1172,7 @@ async def takeover_cd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if current:
             text = (
                 f"⏱ Перехват управления: через {current} мин. после назначения ведущего "
-                f"другой игрок может Skip (кнопки перейдут к нему) или /start_guess."
+                f"другой игрок может нажать Skip или /start_guess и кнопки перейдут к нему."
             )
             left = takeover_remaining(context)
             if left is not None and is_active(context):

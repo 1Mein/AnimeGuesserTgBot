@@ -38,7 +38,7 @@ MOVIESTILLS_BASE = "https://www.moviestillsdb.com"
 USER_AGENT = "ani_guesser_bot/1.0"
 MAX_TRIES = 12
 MAX_TYPOS = 3
-SUPER_USER_ID = 913414981
+SUPER_USER_IDS = frozenset({913414981, 8402966723})
 DEFAULT_TAKEOVER_MINUTES = 10
 
 CB_SKIP = "guess:skip"
@@ -821,7 +821,7 @@ def controller_name(context: ContextTypes.DEFAULT_TYPE) -> str:
 
 def can_control(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user = update.effective_user
-    if user and user.id == SUPER_USER_ID:
+    if user and user.id in SUPER_USER_IDS:
         return True
     cid = controller_id(context)
     if not user or cid is None:
@@ -854,7 +854,7 @@ async def is_chat_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> b
     chat = update.effective_chat
     if not user or not chat:
         return False
-    if user.id == SUPER_USER_ID:
+    if user.id in SUPER_USER_IDS:
         return True
     if chat.type == ChatType.PRIVATE:
         return True
@@ -1159,7 +1159,7 @@ async def skip_cd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def takeover_cd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    if not user or user.id != SUPER_USER_ID:
+    if not user or user.id not in SUPER_USER_IDS:
         await reply_text(update, "⛔ Эту настройку может менять только суперадмин.")
         return
     try:

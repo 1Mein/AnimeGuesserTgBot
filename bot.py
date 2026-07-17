@@ -21,7 +21,7 @@ import psycopg2.extensions
 import requests
 from psycopg2.extras import RealDictCursor
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
-from telegram.constants import ChatAction
+from telegram.constants import ChatAction, ChatMemberStatus, ChatType
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -39,6 +39,7 @@ USER_AGENT = "ani_guesser_bot/1.0"
 MAX_TRIES = 12
 MAX_TYPOS = 3
 SUPER_USER_ID = 913414981
+DEFAULT_TAKEOVER_MINUTES = 10
 
 CB_SKIP = "guess:skip"
 CB_HINT = "guess:hint"
@@ -160,6 +161,15 @@ def init_score_tables() -> None:
             )
             """,
         )
+        execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """,
+        )
 
 
 def get_chat_settings(chat_id: int) -> dict[str, int]:
@@ -179,6 +189,45 @@ def get_chat_settings(chat_id: int) -> dict[str, int]:
         "hint_cooldown": max(0, int(row["hint_cooldown"] or 0)),
         "skip_cooldown": max(0, int(row["skip_cooldown"] or 0)),
     }
+
+
+def get_bot_setting(key: str, default: str = "") -> str:
+    with db() as conn:
+        row = fetchone(
+            conn,
+            "SELECT value FROM bot_settings WHERE key = %s",
+            (key,),
+        )
+    if not row:
+        return default
+    return str(row["value"] or default)
+
+
+def set_bot_setting(key: str, value: str) -> None:
+    with db() as conn:
+        execute(
+            conn,
+            """
+            INSERT INTO bot_settings (key, value)
+            VALUES (%s, %s)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """,
+            (key, value),
+        )
+
+
+def get_takeover_minutes() -> int:
+    raw = get_bot_setting("takeover_minutes", str(DEFAULT_TAKEOVER_MINUTES))
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return DEFAULT_TAKEOVER_MINUTES
+
+
+def set_takeover_minutes(minutes: int) -> int:
+    minutes = max(0, int(minutes))
+    set_bot_setting("takeover_minutes", str(minutes))
+    return minutes
 
 
 def set_chat_cooldown(chat_id: int, kind: str, seconds: int) -> int:
@@ -763,6 +812,7 @@ def set_controller(context: ContextTypes.DEFAULT_TYPE, user) -> None:
     context.chat_data["controller_name"] = (
         f"@{user.username}" if user.username else user.full_name
     )
+    context.chat_data["controller_at"] = time.time()
 
 
 def controller_name(context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -779,8 +829,55 @@ def can_control(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     return user.id == cid
 
 
+def takeover_remaining(context: ContextTypes.DEFAULT_TYPE) -> int | None:
+    """Seconds until others can take over. None = feature off. 0 = ready now."""
+    minutes = get_takeover_minutes()
+    if minutes <= 0:
+        return None
+    started = float(context.chat_data.get("controller_at") or 0)
+    if not started:
+        return 0
+    left = int(minutes * 60 - (time.time() - started))
+    return max(0, left)
+
+
+def can_takeover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Another player may seize Skip / start a new game after the idle timeout."""
+    if can_control(update, context):
+        return False
+    left = takeover_remaining(context)
+    return left is not None and left == 0
+
+
+async def is_chat_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user or not chat:
+        return False
+    if user.id == SUPER_USER_ID:
+        return True
+    if chat.type == ChatType.PRIVATE:
+        return True
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+    except Exception:
+        log.exception("get_chat_member failed chat=%s user=%s", chat.id, user.id)
+        return False
+    return member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+
+
 async def deny_control(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = f"Кнопки только у {controller_name(context)}."
+    left = takeover_remaining(context)
+    if left is None:
+        msg = f"Кнопки только у {controller_name(context)}."
+    elif left > 0:
+        mins = (left + 59) // 60
+        msg = (
+            f"Кнопки у {controller_name(context)}. "
+            f"Перехватить можно через ~{mins} мин."
+        )
+    else:
+        msg = f"Кнопки только у {controller_name(context)}."
     if update.callback_query:
         await update.callback_query.answer(msg, show_alert=True)
     else:
@@ -911,7 +1008,8 @@ async def do_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             await reply_text(update, "Игра не запущена. /start_guess")
         return
-    if not can_control(update, context):
+    may_takeover = can_takeover(update, context)
+    if not can_control(update, context) and not may_takeover:
         await deny_control(update, context)
         return
     chat = update.effective_chat
@@ -920,12 +1018,29 @@ async def do_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if left > 0:
         await deny_cooldown(update, "skip", left)
         return
+    took_over = False
+    if may_takeover:
+        set_controller(context, update.effective_user)
+        took_over = True
     if update.callback_query:
         await update.callback_query.answer()
     challenge = context.chat_data.get("challenge")
     if challenge:
-        await reply_text(update, f"Пропуск.\nПравильный ответ:\n🎬 {challenge['answer']}")
+        prefix = (
+            f"🔄 Управление перешло к {controller_name(context)}.\n"
+            if took_over
+            else ""
+        )
+        await reply_text(
+            update,
+            f"{prefix}Пропуск.\nПравильный ответ:\n🎬 {challenge['answer']}",
+        )
         context.chat_data.pop("challenge", None)
+    elif took_over:
+        await reply_text(
+            update,
+            f"🔄 Управление перешло к {controller_name(context)}.",
+        )
     mark_cooldown_used(context, "skip")
     await send_challenge(update, context)
 
@@ -973,6 +1088,19 @@ def _parse_cooldown_arg(context: ContextTypes.DEFAULT_TYPE) -> int | None:
     return value
 
 
+def _parse_minutes_arg(context: ContextTypes.DEFAULT_TYPE) -> int | None:
+    if not context.args:
+        return None
+    raw = (context.args[0] or "").strip().lower().rstrip("m")
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError("нужно число минут, например: 5")
+    if value < 0 or value > 1440:
+        raise ValueError("таймаут: от 0 до 1440 минут")
+    return value
+
+
 async def hint_cd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     if not chat:
@@ -988,8 +1116,11 @@ async def hint_cd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         text = f"💡 Кулдаун Hint: {current} сек." if current else "💡 Кулдаун Hint: выключен."
         if current and left > 0:
             text += f"\nОсталось до следующего: {left} сек."
-        text += "\nЗадать: /hint_cd 20  (0 = выкл)"
+        text += "\nЗадать: /hint_cd 20  (0 = выкл, только админ чата)"
         await reply_text(update, text)
+        return
+    if not await is_chat_admin(update, context):
+        await reply_text(update, "⛔ Кулдауны кнопок может менять только админ чата.")
         return
     set_chat_cooldown(chat.id, "hint", value)
     if value == 0:
@@ -1013,14 +1144,56 @@ async def skip_cd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         text = f"⏭ Кулдаун Skip: {current} сек." if current else "⏭ Кулдаун Skip: выключен."
         if current and left > 0:
             text += f"\nОсталось до следующего: {left} сек."
-        text += "\nЗадать: /skip_cd 30  (0 = выкл)"
+        text += "\nЗадать: /skip_cd 30  (0 = выкл, только админ чата)"
         await reply_text(update, text)
+        return
+    if not await is_chat_admin(update, context):
+        await reply_text(update, "⛔ Кулдауны кнопок может менять только админ чата.")
         return
     set_chat_cooldown(chat.id, "skip", value)
     if value == 0:
         await reply_text(update, "⏭ Кулдаун Skip выключен.")
     else:
         await reply_text(update, f"⏭ Кулдаун Skip: {value} сек.")
+
+
+async def takeover_cd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user or user.id != SUPER_USER_ID:
+        await reply_text(update, "⛔ Эту настройку может менять только суперадмин.")
+        return
+    try:
+        value = _parse_minutes_arg(context)
+    except ValueError as e:
+        await reply_text(update, f"⛔ {e}\nПример: /takeover_cd 5")
+        return
+    if value is None:
+        current = get_takeover_minutes()
+        if current:
+            text = (
+                f"⏱ Перехват управления: через {current} мин. после назначения ведущего "
+                f"другой игрок может Skip (кнопки перейдут к нему) или /start_guess."
+            )
+            left = takeover_remaining(context)
+            if left is not None and is_active(context):
+                if left > 0:
+                    text += f"\nСейчас до перехвата: ~{(left + 59) // 60} мин."
+                else:
+                    text += "\nСейчас перехват уже доступен."
+        else:
+            text = "⏱ Перехват управления выключен (0)."
+        text += "\nЗадать: /takeover_cd 5  (0 = выкл)"
+        await reply_text(update, text)
+        return
+    set_takeover_minutes(value)
+    if value == 0:
+        await reply_text(update, "⏱ Перехват управления выключен.")
+    else:
+        await reply_text(
+            update,
+            f"⏱ Перехват управления: {value} мин.\n"
+            "После этого другой игрок может Skip (станут его кнопки) или начать новую игру.",
+        )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1031,14 +1204,38 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/stop_guess — остановить\n"
         "/ranking — рейтинг чата\n"
         "/skip /hint — или кнопки под кадром\n"
-        "/skip_cd [сек] — кулдаун Skip\n"
-        "/hint_cd [сек] — кулдаун Hint",
+        "/skip_cd [сек] — кулдаун Skip (админ чата)\n"
+        "/hint_cd [сек] — кулдаун Hint (админ чата)\n"
+        "/takeover_cd [мин] — через сколько мин. можно перехватить ведущего",
     )
 
 
 async def start_guess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if is_active(context) and context.chat_data.get("challenge"):
-        await reply_text(update, "Игра уже идёт. Угадывай или жми Skip / Hint.")
+        if can_takeover(update, context):
+            challenge = context.chat_data.get("challenge")
+            set_controller(context, update.effective_user)
+            prefix = f"🔄 Управление перешло к {controller_name(context)}.\n"
+            if challenge:
+                await reply_text(
+                    update,
+                    f"{prefix}Новая игра.\nПравильный ответ был:\n🎬 {challenge['answer']}",
+                )
+                context.chat_data.pop("challenge", None)
+            else:
+                await reply_text(update, f"{prefix}Новая игра.")
+            context.chat_data["active"] = True
+            await send_challenge(update, context)
+            return
+        left = takeover_remaining(context)
+        if left is not None and left > 0:
+            await reply_text(
+                update,
+                f"Игра уже идёт (ведущий: {controller_name(context)}). "
+                f"Перехватить /start_guess или Skip можно через ~{(left + 59) // 60} мин.",
+            )
+        else:
+            await reply_text(update, "Игра уже идёт. Угадывай или жми Skip / Hint.")
         return
     context.chat_data["active"] = True
     set_controller(context, update.effective_user)
@@ -1055,6 +1252,7 @@ async def stop_guess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     context.chat_data.pop("challenge", None)
     context.chat_data.pop("controller_id", None)
     context.chat_data.pop("controller_name", None)
+    context.chat_data.pop("controller_at", None)
     context.chat_data["attempts"] = 0
     text = "⏹ Игра остановлена."
     if challenge:
@@ -1139,6 +1337,7 @@ def main() -> None:
     app.add_handler(CommandHandler("hint", hint_cmd))
     app.add_handler(CommandHandler("hint_cd", hint_cd_cmd))
     app.add_handler(CommandHandler("skip_cd", skip_cd_cmd))
+    app.add_handler(CommandHandler("takeover_cd", takeover_cd_cmd))
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^guess:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_guess))
 

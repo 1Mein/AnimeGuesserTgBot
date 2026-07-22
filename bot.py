@@ -278,12 +278,25 @@ async def deny_cooldown(
     # Команда без кнопки — без сообщения в чат (только answer у callback).
 
 
-def game_keyboard() -> InlineKeyboardMarkup:
+def game_keyboard(
+    context: ContextTypes.DEFAULT_TYPE | None = None,
+    chat_id: int | None = None,
+) -> InlineKeyboardMarkup:
+    skip_label = "⏭ Skip"
+    hint_label = "💡 Hint"
+    if context is not None and chat_id is not None:
+        settings = get_chat_settings(chat_id)
+        skip_left = cooldown_remaining(context, "skip", settings["skip_cooldown"])
+        hint_left = cooldown_remaining(context, "hint", settings["hint_cooldown"])
+        if skip_left > 0:
+            skip_label = f"⏭ Skip ({skip_left}с)"
+        if hint_left > 0:
+            hint_label = f"💡 Hint ({hint_left}с)"
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("⏭ Skip", callback_data=CB_SKIP),
-                InlineKeyboardButton("💡 Hint", callback_data=CB_HINT),
+                InlineKeyboardButton(skip_label, callback_data=CB_SKIP),
+                InlineKeyboardButton(hint_label, callback_data=CB_HINT),
             ]
         ]
     )
@@ -901,8 +914,11 @@ def make_hint(title: str) -> str:
     return "".join(out)
 
 
-async def reply_photo(update: Update, photo, caption: str) -> None:
-    keyboard = game_keyboard()
+async def reply_photo(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, photo, caption: str
+) -> None:
+    chat = update.effective_chat
+    keyboard = game_keyboard(context, chat.id if chat else None)
     if update.callback_query and update.callback_query.message:
         await update.callback_query.message.reply_photo(
             photo=photo, caption=caption, reply_markup=keyboard
@@ -913,8 +929,18 @@ async def reply_photo(update: Update, photo, caption: str) -> None:
         )
 
 
-async def reply_text(update: Update, text: str, with_keyboard: bool = False) -> None:
-    markup = game_keyboard() if with_keyboard else None
+async def reply_text(
+    update: Update,
+    text: str,
+    with_keyboard: bool = False,
+    context: ContextTypes.DEFAULT_TYPE | None = None,
+) -> None:
+    chat = update.effective_chat
+    markup = (
+        game_keyboard(context, chat.id if chat else None)
+        if with_keyboard and context is not None
+        else None
+    )
     kwargs = {"text": text, "reply_markup": markup, "disable_web_page_preview": True}
     if update.callback_query and update.callback_query.message:
         await update.callback_query.message.reply_text(**kwargs)
@@ -986,7 +1012,7 @@ async def send_challenge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         raw, filename = await asyncio.to_thread(_download)
         photo = InputFile(BytesIO(raw), filename=filename)
-        await reply_photo(update, photo, caption)
+        await reply_photo(update, context, photo, caption)
     except Exception as e:
         log.exception("send photo failed")
         await reply_text(update, f"Не удалось отправить кадр: {e}")
@@ -1069,10 +1095,14 @@ async def do_hint(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     hint = make_hint(challenge.get("title") or "")
     if not hint:
-        await reply_text(update, "Подсказку дать нечего — жми Skip", with_keyboard=True)
+        await reply_text(
+            update, "Подсказку дать нечего — жми Skip", with_keyboard=True, context=context
+        )
         return
     mark_cooldown_used(context, "hint")
-    await reply_text(update, f"💡 Подсказка: {hint}", with_keyboard=True)
+    await reply_text(
+        update, f"💡 Подсказка: {hint}", with_keyboard=True, context=context
+    )
 
 
 def _parse_cooldown_arg(context: ContextTypes.DEFAULT_TYPE) -> int | None:

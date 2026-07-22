@@ -268,6 +268,16 @@ def mark_cooldown_used(context: ContextTypes.DEFAULT_TYPE, kind: str) -> None:
     context.chat_data[f"last_{kind}_at"] = time.time()
 
 
+def start_round_cooldowns(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    """Each new frame starts skip/hint on the chat's configured cooldown."""
+    settings = get_chat_settings(chat_id)
+    now = time.time()
+    if settings["skip_cooldown"] > 0:
+        context.chat_data["last_skip_at"] = now
+    if settings["hint_cooldown"] > 0:
+        context.chat_data["last_hint_at"] = now
+
+
 async def deny_cooldown(
     update: Update, kind: str, remaining: int
 ) -> None:
@@ -1012,6 +1022,9 @@ async def send_challenge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         raw, filename = await asyncio.to_thread(_download)
         photo = InputFile(BytesIO(raw), filename=filename)
+        chat = update.effective_chat
+        if chat:
+            start_round_cooldowns(context, chat.id)
         await reply_photo(update, context, photo, caption)
     except Exception as e:
         log.exception("send photo failed")
@@ -1067,7 +1080,6 @@ async def do_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             update,
             f"🔄 Управление перешло к {controller_name(context)}.",
         )
-    mark_cooldown_used(context, "skip")
     await send_challenge(update, context)
 
 
